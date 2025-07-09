@@ -854,7 +854,7 @@ local function is_spell_available(spell_id, caster, target)
     end
 end
 
--- Cast offensive spells
+-- Enhanced offensive spell casting with burst mode support
 local function cast_offensive_spells(caster, target)
     if not menu_elements.enable_offensive:get_state() then
         return false
@@ -863,16 +863,44 @@ local function cast_offensive_spells(caster, target)
     local current_spells = get_current_class_spells()
     local offensive_spells = current_spells.offensive or {}
     
-    -- Sort by priority
+    -- Sort by priority, but consider burst mode
     table.sort(offensive_spells, function(a, b)
-        return (a.priority or 999) < (b.priority or 999)
+        local a_priority = a.priority or 999
+        local b_priority = b.priority or 999
+        
+        -- In burst mode, prioritize high-damage spells
+        if menu_elements.burst_mode:get_state() then
+            local burst_spells = {"Execute", "Chaos Bolt", "Pyroblast", "Templar's Verdict", "Annihilation"}
+            local a_is_burst = false
+            local b_is_burst = false
+            
+            for _, burst_spell in ipairs(burst_spells) do
+                if a.name == burst_spell then a_is_burst = true end
+                if b.name == burst_spell then b_is_burst = true end
+            end
+            
+            if a_is_burst and not b_is_burst then return true end
+            if b_is_burst and not a_is_burst then return false end
+        end
+        
+        return a_priority < b_priority
     end)
     
     for _, spell_data in ipairs(offensive_spells) do
         if is_spell_available(spell_data.id, caster, target) then
             -- Check if it's an AoE spell and we have multiple targets
-            if spell_data.name == "Flamestrike" or spell_data.name == "Divine Storm" or 
-               spell_data.name == "Thunder Clap" or spell_data.name == "Consecration" then
+            local aoe_spells = {"Flamestrike", "Divine Storm", "Thunder Clap", "Consecration", 
+                               "Chain Lightning", "Blade Dance", "Whirlwind", "Cleave"}
+            local is_aoe_spell = false
+            
+            for _, aoe_spell in ipairs(aoe_spells) do
+                if spell_data.name == aoe_spell then
+                    is_aoe_spell = true
+                    break
+                end
+            end
+            
+            if is_aoe_spell then
                 local enemies_around = unit_helper:get_enemy_list_around(target:get_position(), 8.0)
                 if #enemies_around > 1 then
                     -- Use position cast for AoE spells
@@ -1009,7 +1037,86 @@ local function cast_utility_spells(caster, target)
     return false
 end
 
--- Main rotation logic
+-- Enhanced target prioritization
+local function get_best_target(targets)
+    if not targets or #targets == 0 then
+        return nil
+    end
+    
+    local best_target = nil
+    local best_score = -1
+    
+    for _, target in ipairs(targets) do
+        local score = 0
+        
+        -- Basic distance scoring (closer is better)
+        local distance = target:get_position():dist_to(local_player:get_position())
+        score = score + math.max(0, 50 - distance)
+        
+        -- Health percentage scoring (lower health = higher priority)
+        local health_percentage = unit_helper:get_health_percentage(target)
+        score = score + (100 - health_percentage * 100)
+        
+        -- Check if target is casting (interrupt priority)
+        if target:is_casting() then
+            score = score + 200
+        end
+        
+        -- Check if target is a player (PvP priority)
+        if target:is_player() then
+            score = score + 100
+        end
+        
+        -- Check if target is a healer (priority target)
+        local role = unit_helper:get_role_id(target)
+        if role == enums.group_role.HEALER then
+            score = score + 150
+        end
+        
+        -- Check if target has burst active
+        if pvp_helper:has_burst_active(target, 5000) then
+            score = score + 75
+        end
+        
+        if score > best_score then
+            best_score = score
+            best_target = target
+        end
+    end
+    
+    return best_target
+end
+
+-- Enhanced resource management
+local function should_conserve_resources(caster)
+    -- Check mana/energy/rage levels and return true if we should conserve
+    local power_type = caster:get_power_type()
+    local current_power = caster:get_power_percentage()
+    
+    -- For mana users, conserve below 30%
+    if power_type == enums.power_type.MANA and current_power < 0.3 then
+        return true
+    end
+    
+    -- For energy users, conserve below 50%
+    if power_type == enums.power_type.ENERGY and current_power < 0.5 then
+        return true
+    end
+    
+    -- For rage users, don't conserve (rage decays)
+    if power_type == enums.power_type.RAGE then
+        return false
+    end
+    
+    -- For other power types, conserve below 40%
+    if current_power < 0.4 then
+        return true
+    end
+    
+    return false
+end
+
+-- Main rotation logic with enhanced features
 local function execute_rotation()
     local local_player = core.object_manager.get_local_player()
     if not local_player then
@@ -1026,6 +1133,9 @@ local function execute_rotation()
         return
     end
     
+    -- Check if we should conserve resources
+    local conserve_resources = should_conserve_resources(local_player)
+    
     -- Defensive logic first (highest priority)
     if cast_defensive_spells(local_player) then
         return
@@ -1037,8 +1147,42 @@ local function execute_rotation()
     end
     
     -- Get targets for offensive actions
-    local targets = target_selector:get_targets(3)
+    local targets = target_selector:get_targets(5) -- Get more targets for better selection
     
+    -- Get the best target using enhanced prioritization
+    local best_target = get_best_target(targets)
+    
+    if best_target then
+        -- Check if target is in combat
+        if not unit_helper:is_in_combat(best_target) then
+            return
+        end
+        
+        -- Check if target is immune to damage
+        if pvp_helper:is_damage_immune(best_target, pvp_helper.damage_type_flags.ANY) then
+            return
+        end
+        
+        -- Check if target is in CC that we shouldn't break
+        if pvp_helper:is_crowd_controlled(best_target, 
+            pvp_helper.cc_flags.combine("DISORIENT", "INCAPACITATE", "SAP"), 1000) then
+            return
+        end
+        
+        -- Try utility spells first (interrupts, dispels)
+        if cast_utility_spells(local_player, best_target) then
+            return
+        end
+        
+        -- If we're not conserving resources, try offensive spells
+        if not conserve_resources then
+            if cast_offensive_spells(local_player, best_target) then
+                return
+            end
+        end
+    end
+    
+    -- If no best target, try regular target processing
     for _, target in ipairs(targets) do
         -- Check if target is in combat
         if not unit_helper:is_in_combat(target) then
@@ -1061,9 +1205,11 @@ local function execute_rotation()
             return
         end
         
-        -- Try offensive spells
-        if cast_offensive_spells(local_player, target) then
-            return
+        -- If we're not conserving resources, try offensive spells
+        if not conserve_resources then
+            if cast_offensive_spells(local_player, target) then
+                return
+            end
         end
         
         ::continue::
